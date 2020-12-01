@@ -27,6 +27,21 @@ interface EntityPlusControllerInterface extends EntityControllerInterface {
    */
   public function invoke($hook, $entity);
 
+	/**
+   * Checks if the entity has a certain exportable status.
+   *
+   * @param $status
+   *   A status constant, i.e. one of ENTITY_CUSTOM, ENTITY_IN_CODE,
+   *   ENTITY_OVERRIDDEN or ENTITY_FIXED.
+   *
+   * @return bool
+   *   For exportable entities TRUE if the entity has the status, else FALSE.
+   *   In case the entity is not exportable, NULL is returned.
+   *
+   * @see entity_has_status()
+   */
+  public function hasStatus($status);
+
   /**
    * Permanently saves the given entity.
    *
@@ -111,7 +126,7 @@ interface EntityPlusControllerInterface extends EntityControllerInterface {
    *   in another context. If FALSE the entity will be displayed with its title
    *   in a mode suitable for lists.
    *   If unset, the page mode will be enabled if the current path is the URI
-   *   of the entity, as returned by entity_plus_uri().
+   *   of the entity, as returned by entity_uri().
    *   This parameter is only supported for entities which controller is a
    *   EntityPlusControllerInterface.
    * @return
@@ -148,10 +163,12 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
   protected $cacheComplete = FALSE;
   protected $bundleKey;
   protected $defaultRevisionKey;
+  protected $staticCache;
+  protected $persistentCache;
 
   /**
    * Overridden.
-   * @see BackdropDefaultEntityController#__construct()
+   * @see DefaultEntityController#__construct()
    */
   public function __construct($entityType) {
     parent::__construct($entityType);
@@ -161,10 +178,17 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
       $this->bundleKey = $info['bundle keys']['bundle'];
     }
     $this->defaultRevisionKey = !empty($this->entityInfo['entity keys']['default revision']) ? $this->entityInfo['entity keys']['default revision'] : 'default_revision';
+
+    // @todo: Remove this in a future version of the module.
+    // Compatibility with versions of backdrop older than 1.16.x.
+    if (isset($this->cache)) {
+      $this->staticCache = $this->cache;
+      $this->persistentCache = FALSE;
+    }
   }
 
   /**
-   * Overrides BackdropDefaultEntityController::buildQuery().
+   * Overrides DefaultEntityController::buildQuery().
    */
   protected function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
     $query = parent::buildQuery($ids, $conditions, $revision_id);
@@ -219,7 +243,7 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
     $passed_ids = !empty($ids) ? array_flip($ids) : FALSE;
 
     // Try to load entities from the static cache.
-    if ($this->cache && !$revision_id) {
+    if ($this->staticCache && !$revision_id) {
       $entities = $this->cacheGet($ids, $conditions);
       // If any entities were loaded, remove them from the ids still to load.
       if ($passed_ids) {
@@ -227,17 +251,28 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
       }
     }
 
-    // Support the entitycache module if activated.
-    if (!empty($this->entityInfo['entity cache']) && !$revision_id && $ids && !$conditions) {
-      $cached_entities = EntityCacheControllerHelper::entityCacheGet($this, $ids, $conditions);
-      // If any entities were loaded, remove them from the ids still to load.
-      $ids = array_diff($ids, array_keys($cached_entities));
+    // Try to load entities from the persistent cache.
+    if ($this->persistentCache && !$revision_id && $ids && !$conditions) {
+      $cached_entities = array();
+      if ($ids && !$conditions) {
+        $cached = cache_get_multiple($ids, 'cache_entity_' . $this->entityType);
+
+        if ($cached) {
+          foreach ($cached as $item) {
+            $cached_entities[$item->cid] = $item->data;
+          }
+        }
+      }
       $entities += $cached_entities;
 
-      // Add loaded entities to the static cache if we are not loading a
-      // revision.
-      if ($this->cache && !empty($cached_entities) && !$revision_id) {
-        $this->cacheSet($cached_entities);
+      // If any entities were loaded, remove them from the ids still to load.
+      $ids = array_diff($ids, array_keys($cached_entities));
+
+      if ($this->staticCache) {
+        // Add entities to the cache if we are not loading a revision.
+        if (!empty($cached_entities) && !$revision_id) {
+          $this->cacheSet($cached_entities);
+        }
       }
     }
 
@@ -282,13 +317,22 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
       $entities += $queried_entities;
     }
 
-    // Entitycache module support: Add entities to the entity cache if we are
-    // not loading a revision.
-    if (!empty($this->entityInfo['entity cache']) && !empty($queried_entities) && !$revision_id) {
-      EntityCacheControllerHelper::entityCacheSet($this, $queried_entities);
+    // Add entities to the entity cache if we are not loading a revision.
+    if ($this->persistentCache && !empty($queried_entities) && !$revision_id) {
+      // Only cache the entities which were loaded by ID. Entities that were
+      // loaded based on conditions will never be found via cacheGet() and we
+      // would keep on caching them.
+      if ($passed_ids) {
+        $queried_entities_by_id = array_intersect_key($queried_entities, $passed_ids);
+        if (!empty($queried_entities_by_id)) {
+          foreach ($queried_entities_by_id as $id => $item) {
+            cache_set($id, $item, 'cache_entity_' . $this->entityType);
+          }
+        }
+      }
     }
 
-    if ($this->cache) {
+    if ($this->staticCache) {
       // Add entities to the cache if we are not loading a revision.
       if (!empty($queried_entities) && !$revision_id) {
         $this->cacheSet($queried_entities);
@@ -316,10 +360,6 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
   public function resetCache(array $ids = NULL) {
     $this->cacheComplete = FALSE;
     parent::resetCache($ids);
-    // Support the entitycache module.
-    if (!empty($this->entityInfo['entity cache'])) {
-      EntityCacheControllerHelper::resetEntityCache($this, $ids);
-    }
   }
 
   /**
@@ -353,6 +393,9 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
     // Invoke the respective entity level hook.
     if ($hook == 'presave' || $hook == 'insert' || $hook == 'update' || $hook == 'delete') {
       if (is_a($entity, 'Entity')) {
+        // Invoke all regular entity hooks as well as entity_plus hooks.
+        // See https://github.com/backdrop-contrib/entity_plus/issues/35
+        module_invoke_all('entity_' . $hook, $entity, $this->entityType);
         module_invoke_all('entity_plus_' . $hook, $entity, $this->entityType);
       }
     }
@@ -423,6 +466,15 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
       return TRUE;
     }
     return FALSE;
+  }
+
+	/**
+   * {@inheritdoc}
+   */
+  public function hasStatus($status) {
+    if (!empty($this->entityInfo['exportable'])) {
+      return isset($this->{$this->statusKey}) && ($this->{$this->statusKey} & $status) == $status;
+    }
   }
 
   /**
@@ -667,7 +719,7 @@ class EntityPlusController extends DefaultEntityController implements EntityPlus
         // If the entity type provides an implementation, use this instead the
         // generic one.
         // @see template_preprocess_entity()
-        '#theme' => 'entity',
+        '#theme' => 'entity_plus',
         '#entity_plus_type' => $this->entityType,
         '#entity' => $entity,
         '#view_mode' => $view_mode,
@@ -744,7 +796,7 @@ class EntityPlusControllerExportable extends EntityPlusController {
     $passed_ids = !empty($ids) ? array_flip($ids) : FALSE;
 
     // Care about the static cache.
-    if ($this->cache && !$revision_id) {
+    if ($this->staticCache && !$revision_id) {
       $entities = $this->cacheGetByName($ids, $conditions);
     }
     // If any entities were loaded, remove them from the ids still to load.
